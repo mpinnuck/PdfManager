@@ -4,8 +4,8 @@ merge_view.py
 View for the PDF merge operation.
 
 Displays a two-panel layout:
-- Left: vertically scrollable list of PDF thumbnail cards (reorderable).
-- Right: first-page PDF preview for the selected document.
+- Left: selectable, reorderable list of PDF pages.
+- Right: preview of the selected page.
 
 The panel split is resizable and the preview expands to fill available space.
 """
@@ -15,16 +15,23 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from PIL import ImageTk
 
+from models.pdf_page import PdfPage
 from viewmodels.merge_viewmodel import MergeViewModel
 
 
-# Card dimensions
-CARD_WIDTH = 130
-CARD_THUMB_W = 80
-CARD_THUMB_H = 105
-CARD_PAD = 8
-CARD_TOTAL_H = CARD_THUMB_H + 50  # thumbnail + label area
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v2.0.0"
+
+# Page tile dimensions (left-hand reorderable list)
+TILE_WIDTH = 120
+TILE_THUMB_W = 76
+TILE_THUMB_H = 100
+TILE_PAD = 6
+
+# Preview zoom (view-only; has no effect on the merged output PDF)
+PREVIEW_ZOOM_STEP = 1.6
+PREVIEW_MIN_ZOOM = 1.0
+PREVIEW_MAX_ZOOM = 6.0
+PREVIEW_MAX_RENDER_DIM = 2600
 
 
 class OutputPreviewWindow(tk.Toplevel):
@@ -211,71 +218,60 @@ class OutputPreviewWindow(tk.Toplevel):
         )
 
 
-class ThumbnailCard(tk.Frame):
+class PageTile(tk.Frame):
     """
-    A single card in the merge list displaying one PDF document.
+    A single tile in the page list, showing a thumbnail of one page.
 
     Attributes:
-        index:     Current position in the list (updated on refresh).
-        _photo:    Keeps a reference to the PhotoImage to prevent GC.
+        page:     The PdfPage this tile represents.
+        position: Current zero-based index within the merged page order.
     """
 
-    def __init__(self, parent: tk.Widget, index: int, doc, on_remove, **kwargs):
-        """
-        Args:
-            parent:    Parent widget.
-            index:     Zero-based position of this card.
-            doc:       PdfDocument instance.
-            on_remove: Callback(index) called when the × button is clicked.
-        """
-        super().__init__(parent, bd=1, relief=tk.RAISED,
-                         bg="#f5f5f5", width=CARD_WIDTH, **kwargs)
-        self.index = index
-        self._photo: ImageTk.PhotoImage | None = None
-        self._build(doc, on_remove)
+    def __init__(self, parent: tk.Widget, page: PdfPage, position: int,
+                 photo: ImageTk.PhotoImage | None, **kwargs):
+        super().__init__(parent, bd=2, relief=tk.RAISED,
+                         bg="#f5f5f5", width=TILE_WIDTH, **kwargs)
+        self.page = page
+        self.position = position
+        self._photo = photo  # keep a reference to prevent garbage collection
+        self._build()
 
-    def _build(self, doc, on_remove) -> None:
-        """Construct internal widgets."""
+    def _build(self) -> None:
         self.pack_propagate(False)
-        self.configure(height=CARD_TOTAL_H + CARD_PAD * 2)
+        self.configure(height=TILE_THUMB_H + 46)
 
-        # ── Thumbnail image ──────────────────────────────────────────
-        if doc.thumbnail:
-            img = doc.thumbnail.copy()
-            img.thumbnail((CARD_THUMB_W, CARD_THUMB_H))
-            self._photo = ImageTk.PhotoImage(img)
+        if self._photo is not None:
             thumb_label = tk.Label(self, image=self._photo, bg="#f5f5f5")
         else:
             thumb_label = tk.Label(self, text="[No preview]",
-                                   width=CARD_THUMB_W, height=CARD_THUMB_H,
+                                   width=TILE_THUMB_W // 7, height=TILE_THUMB_H // 14,
                                    bg="#cccccc")
-        thumb_label.pack(pady=(CARD_PAD, 2))
+        thumb_label.pack(pady=(TILE_PAD, 2))
 
-        # ── Filename ─────────────────────────────────────────────────
-        name = doc.name if len(doc.name) <= 26 else doc.name[:23] + "…"
+        name = self.page.path.name
+        if len(name) > 20:
+            name = name[:17] + "…"
         tk.Label(self, text=name, bg="#f5f5f5",
-                 font=("Helvetica", 10), wraplength=CARD_WIDTH - 10).pack()
+                 font=("Helvetica", 8), wraplength=TILE_WIDTH - 10).pack()
 
-        # ── Page count ───────────────────────────────────────────────
-        tk.Label(self, text=f"{doc.page_count} page{'s' if doc.page_count != 1 else ''}",
-                 bg="#f5f5f5", fg="#666666", font=("Helvetica", 9)).pack()
+        tk.Label(self, text=f"Page {self.page.page_index + 1}  ·  #{self.position + 1}",
+                 bg="#f5f5f5", fg="#666666", font=("Helvetica", 8)).pack()
 
-        # ── Remove button ────────────────────────────────────────────
-        tk.Button(self, text="✕ Remove", font=("Helvetica", 9),
-                  command=lambda: on_remove(self.index),
-                  relief=tk.FLAT, bg="#e0e0e0", cursor="hand2").pack(pady=(4, CARD_PAD))
-
-        # ── Drag handle label ─────────────────────────────────────────
-        tk.Label(self, text="⠿ drag to reorder", fg="#aaaaaa",
-                 bg="#f5f5f5", font=("Helvetica", 8)).pack()
+    def set_style(self, bg: str, relief: str) -> None:
+        """Update tile background/relief to reflect selection/drag state."""
+        self.configure(bg=bg, relief=relief)
+        for child in self.winfo_children():
+            try:
+                child.configure(bg=bg)
+            except tk.TclError:
+                pass
 
 
 class MergeView(tk.Frame):
     """
-    Full merge view: toolbar + scrollable card list.
+    Full merge view: toolbar + selectable page list and preview.
 
-    Wires drag-reorder behaviour onto the card list and delegates all
-    data operations to MergeViewModel.
+    Wires page selection and drag-reorder behaviour to MergeViewModel.
     """
 
     def __init__(self, parent: tk.Widget, viewmodel: MergeViewModel,
@@ -291,16 +287,37 @@ class MergeView(tk.Frame):
         self._vm = viewmodel
         self._config = config
         self._save_config = save_config_fn
-        self._cards: list[ThumbnailCard] = []
-        self._selected_index: int | None = None
-        self._preview_page_index: int = 0
+
+        self._page_tiles: list[PageTile] = []
+        self._thumbnail_cache: dict[tuple[Path, int], ImageTk.PhotoImage] = {}
+        self._selected_pages: set[PdfPage] = set()
+        self._active_page: PdfPage | None = None
+        self._shift_anchor_page: PdfPage | None = None
+
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._preview_after_id: str | None = None
         self._last_output_path: Path | None = None
         self._output_preview_window: OutputPreviewWindow | None = None
 
+        # Preview zoom/pan state (view-only; does not affect the merged PDF)
+        self._preview_zoom = PREVIEW_MIN_ZOOM
+        self._preview_pan = (0.5, 0.5)
+        self._preview_rendered_page: PdfPage | None = None
+        self._preview_render_info: dict[str, int] | None = None
+        self._preview_press_pos: tuple[int, int] | None = None
+        self._preview_press_pan: tuple[float, float] | None = None
+        self._preview_dragging = False
+
         # Drag state
-        self._drag_card: ThumbnailCard | None = None
+        self._press_page: PdfPage | None = None
+        self._press_mode: str | None = None
+        self._press_root: tuple[int, int] | None = None
+        self._dragging = False
+        self._drag_pages: list[PdfPage] | None = None
+        self._drag_target_index: int | None = None
+        self._drag_insert_after = False
+        self._drop_before_tile: PageTile | None = None
+        self._drag_ghost: tk.Toplevel | None = None
 
         self._vm.set_on_change(self.refresh)
         self._build()
@@ -351,7 +368,28 @@ class MergeView(tk.Frame):
                   cursor="hand2").pack(side=tk.RIGHT, padx=4)
 
     def _build_scroll_area(self, parent: tk.Widget) -> None:
-        """Scrollable canvas that holds the card list."""
+        """Create the scrollable, thumbnail-based page list."""
+        tk.Label(
+            parent,
+            text="Click to select page(s); drag to reorder",
+            anchor=tk.W,
+            bg="#ffffff",
+            fg="#555555",
+            padx=8,
+            pady=6,
+        ).pack(side=tk.TOP, fill=tk.X)
+
+        self._remove_pdf_button = tk.Button(
+            parent,
+            text="Remove Source PDF",
+            command=self._on_remove_selected_pdf,
+            relief=tk.FLAT,
+            bg="#e8e8e8",
+            padx=8,
+            pady=5,
+        )
+        self._remove_pdf_button.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=6)
+
         container = tk.Frame(parent)
         container.pack(fill=tk.BOTH, expand=True)
 
@@ -363,31 +401,62 @@ class MergeView(tk.Frame):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._card_frame = tk.Frame(self._canvas, bg="#ffffff")
+        self._tile_frame = tk.Frame(self._canvas, bg="#ffffff")
         self._canvas_window = self._canvas.create_window(
-            (0, 0), window=self._card_frame, anchor="nw")
+            (0, 0), window=self._tile_frame, anchor="nw")
 
-        self._card_frame.bind("<Configure>", self._on_frame_configure)
+        self._tile_frame.bind("<Configure>", self._on_frame_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mouse-wheel scrolling
         self._canvas.bind("<MouseWheel>", self._on_mousewheel)
         self._canvas.bind("<Button-4>", self._on_mousewheel)
         self._canvas.bind("<Button-5>", self._on_mousewheel)
+
+        self._empty_page_label = tk.Label(
+            container,
+            text="Add PDF files to get started.",
+            fg="#888888",
+            bg="#ffffff",
+            font=("Helvetica", 12),
+        )
+        self._empty_page_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     def _build_preview_area(self, parent: tk.Widget) -> None:
         """Right-side preview canvas that grows with the window."""
         preview_container = tk.Frame(parent, bg="#222222")
         preview_container.pack(fill=tk.BOTH, expand=True)
 
-        self._preview_canvas = tk.Canvas(preview_container, bg="#262626", highlightthickness=0)
+        self._preview_label = tk.Label(
+            preview_container,
+            text="Select a page to preview",
+            anchor=tk.W,
+            bg="#222222",
+            fg="#dddddd",
+            padx=10,
+            pady=6,
+        )
+        self._preview_label.pack(side=tk.TOP, fill=tk.X)
+
+        preview_content = tk.Frame(preview_container, bg="#262626")
+        preview_content.pack(fill=tk.BOTH, expand=True)
+        self._preview_canvas = tk.Canvas(preview_content, bg="#262626",
+                                         highlightthickness=0)
         self._preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._preview_canvas.bind("<MouseWheel>", self._on_preview_mousewheel)
         self._preview_canvas.bind("<Button-4>", self._on_preview_mousewheel)
         self._preview_canvas.bind("<Button-5>", self._on_preview_mousewheel)
 
+        # Left-click zooms in (centered on the cursor); click-and-drag pans
+        # while zoomed in. Right-click zooms back out. View-only: does not
+        # affect the merged output PDF.
+        self._preview_canvas.bind("<ButtonPress-1>", self._on_preview_press)
+        self._preview_canvas.bind("<B1-Motion>", self._on_preview_drag)
+        self._preview_canvas.bind("<ButtonRelease-1>", self._on_preview_release)
+        self._preview_canvas.bind("<Button-2>", self._on_preview_zoom_out_click)
+        self._preview_canvas.bind("<Button-3>", self._on_preview_zoom_out_click)
+
         self._preview_scrollbar = ttk.Scrollbar(
-            preview_container,
+            preview_content,
             orient=tk.VERTICAL,
             command=self._on_preview_scrollbar,
         )
@@ -427,44 +496,40 @@ class MergeView(tk.Frame):
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Rebuild the card list from the current viewmodel document list."""
-        # Destroy existing cards
-        for card in self._cards:
-            card.destroy()
-        self._cards.clear()
+        """Rebuild the page tile list from the current viewmodel page order."""
+        pages = self._vm.pages
+        valid_keys = {(page.path.resolve(), page.page_index) for page in pages}
+        self._thumbnail_cache = {
+            key: photo for key, photo in self._thumbnail_cache.items()
+            if key in valid_keys
+        }
 
-        docs = self._vm.documents
-        for i, doc in enumerate(docs):
-            card = ThumbnailCard(self._card_frame, index=i,
-                                 doc=doc, on_remove=self._on_remove)
-            card.pack(fill=tk.X, padx=10, pady=6)
-            self._attach_drag(card)
-            self._cards.append(card)
+        self._selected_pages.intersection_update(pages)
+        if self._active_page not in pages:
+            self._active_page = pages[0] if pages else None
 
-        # Empty state label
-        if not docs:
-            tk.Label(self._card_frame, text="Add PDF files to get started.",
-                     fg="#aaaaaa", bg="#ffffff",
-                     font=("Helvetica", 13)).pack(pady=40)
+        self._rebuild_page_tiles()
+
+        if pages:
+            self._empty_page_label.place_forget()
+        else:
+            self._empty_page_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self._remove_pdf_button.configure(
+            state=tk.NORMAL if pages else tk.DISABLED
+        )
 
         # Status bar
-        if docs:
-            total = sum(d.page_count for d in docs)
+        if self._vm.documents:
             self._status_var.set(
-                f"{len(docs)} file{'s' if len(docs) != 1 else ''} · {total} pages total")
+                f"{len(self._vm.documents)} file"
+                f"{'s' if len(self._vm.documents) != 1 else ''} · "
+                f"{len(pages)} pages total")
         else:
             self._status_var.set("No files loaded.")
 
-        if self._selected_index is None and docs:
-            self._selected_index = 0
-            self._preview_page_index = 0
-        if self._selected_index is not None and self._selected_index >= len(docs):
-            self._selected_index = len(docs) - 1 if docs else None
-            self._preview_page_index = 0
-
-        self._refresh_card_styles()
         self._schedule_preview_render()
         self._persist_session_state()
+
 
     def _restore_session_state(self) -> None:
         """Restore input files and last output path from saved config."""
@@ -472,6 +537,7 @@ class MergeView(tk.Frame):
         if isinstance(stored_output, str) and stored_output:
             self._last_output_path = Path(stored_output)
 
+        stored_page_order = self._config.get("session_page_order", [])
         stored_files = self._config.get("session_input_files", [])
         if isinstance(stored_files, list):
             restore_paths = [
@@ -481,9 +547,35 @@ class MergeView(tk.Frame):
             if restore_paths:
                 self._vm.add_files(restore_paths)
 
+        if isinstance(stored_page_order, list):
+            restored_pages: list[PdfPage] = []
+            for entry in stored_page_order:
+                if (
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("path"), str)
+                    or type(entry.get("page_index")) is not int
+                ):
+                    restored_pages = []
+                    break
+                restored_pages.append(
+                    PdfPage(
+                        path=Path(entry["path"]).resolve(),
+                        page_index=entry["page_index"],
+                    )
+                )
+            if (
+                len(restored_pages) == len(self._vm.pages)
+                and set(restored_pages) == set(self._vm.pages)
+            ):
+                self._vm.set_page_order(restored_pages)
+
     def _persist_session_state(self) -> None:
         """Persist current input list and output path so project can resume."""
         self._config["session_input_files"] = [str(doc.path) for doc in self._vm.documents]
+        self._config["session_page_order"] = [
+            {"path": str(page.path), "page_index": page.page_index}
+            for page in self._vm.pages
+        ]
         self._config["session_last_output"] = (
             str(self._last_output_path) if self._last_output_path else None
         )
@@ -513,23 +605,36 @@ class MergeView(tk.Frame):
             messagebox.showwarning("Some files could not be loaded",
                                    "\n".join(errors))
 
-    def _on_remove(self, index: int) -> None:
-        """Remove a document by index."""
-        if self._selected_index is not None:
-            if index == self._selected_index:
-                self._selected_index = None
-                self._preview_page_index = 0
-            elif index < self._selected_index:
-                self._selected_index -= 1
-        self._vm.remove(index)
+    def _on_remove_selected_pdf(self) -> None:
+        """Remove the source PDF for the currently selected page or pages."""
+        if not self._selected_pages:
+            messagebox.showinfo("No page selected", "Select a page from the PDF to remove.")
+            return
+
+        selected_paths = {page.path.resolve() for page in self._selected_pages}
+        if len(selected_paths) != 1:
+            messagebox.showinfo(
+                "Select pages from one PDF",
+                "Select pages from a single PDF to remove that source file.",
+            )
+            return
+
+        path = next(iter(selected_paths))
+        document_index = next(
+            (i for i, doc in enumerate(self._vm.documents)
+             if doc.path.resolve() == path),
+            None,
+        )
+        if document_index is not None:
+            self._vm.remove(document_index)
 
     def _on_clear(self) -> None:
         """Clear all documents after confirmation."""
         if self._vm.is_empty:
             return
         if messagebox.askyesno("Clear all", "Remove all loaded PDF files?"):
-            self._selected_index = None
-            self._preview_page_index = 0
+            self._active_page = None
+            self._selected_pages.clear()
             self._vm.clear()
 
     def _on_save(self) -> None:
@@ -582,66 +687,61 @@ class MergeView(tk.Frame):
             self._output_preview_window.focus_force()
 
     # ------------------------------------------------------------------
-    # Drag-to-reorder
+    # Page tiles: build, select, and drag-to-reorder
     # ------------------------------------------------------------------
 
-    def _attach_drag(self, card: ThumbnailCard) -> None:
-        """Bind drag events to a card and all its child widgets."""
-        for widget in [card] + card.winfo_children():
-            widget.bind("<ButtonPress-1>", self._drag_start)
-            widget.bind("<B1-Motion>", self._drag_motion)
-            widget.bind("<ButtonRelease-1>", self._drag_end)
+    def _rebuild_page_tiles(self) -> None:
+        """Destroy and recreate page tiles to match the viewmodel order."""
+        for tile in self._page_tiles:
+            tile.destroy()
+        self._page_tiles = []
 
-    def _drag_start(self, event: tk.Event) -> None:
-        """Record the card being dragged and select it for preview."""
-        widget = event.widget
-        # Walk up to find the ThumbnailCard
-        card = self._find_card(widget)
-        if card is None:
-            return
-        self._drag_card = card
-        if self._selected_index != card.index:
-            self._preview_page_index = 0
-        self._selected_index = card.index
-        self._refresh_card_styles(dragging_index=card.index)
-        self._schedule_preview_render()
+        for position, page in enumerate(self._vm.pages):
+            photo = self._get_thumbnail(page)
+            tile = PageTile(self._tile_frame, page=page, position=position, photo=photo)
+            tile.pack(fill=tk.X, padx=10, pady=6)
+            self._attach_tile_events(tile)
+            self._page_tiles.append(tile)
 
-    def _drag_motion(self, event: tk.Event) -> None:
-        """Highlight the insertion target as the card is dragged."""
-        if self._drag_card is None:
-            return
-        y_root = event.y_root
-        target = self._get_target_index(y_root)
-        self._refresh_card_styles(target_index=target,
-                                  dragging_index=self._drag_card.index)
+        self._refresh_tile_styles()
 
-    def _drag_end(self, event: tk.Event) -> None:
-        """Complete the drag: move the document to the new position."""
-        if self._drag_card is None:
-            return
-        target = self._get_target_index(event.y_root)
-        from_idx = self._drag_card.index
-        self._drag_card = None
+    def _get_thumbnail(self, page: PdfPage) -> ImageTk.PhotoImage | None:
+        """Return a cached thumbnail for a page, rendering it if needed."""
+        key = (page.path.resolve(), page.page_index)
+        cached = self._thumbnail_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            image = self._vm.render_preview_for_file(
+                page.path,
+                page_index=page.page_index,
+                max_width=TILE_THUMB_W,
+                max_height=TILE_THUMB_H,
+            )
+        except Exception:
+            return None
+        photo = ImageTk.PhotoImage(image)
+        self._thumbnail_cache[key] = photo
+        return photo
 
-        if target != from_idx:
-            if self._selected_index is not None:
-                if self._selected_index == from_idx:
-                    self._selected_index = target
-                elif from_idx < self._selected_index <= target:
-                    self._selected_index -= 1
-                elif target <= self._selected_index < from_idx:
-                    self._selected_index += 1
-            self._vm.move(from_idx, target)  # triggers refresh via callback
-            return
+    def _attach_tile_events(self, tile: PageTile) -> None:
+        """Bind selection, drag, and context-menu events to a tile and its children."""
+        for widget in [tile] + tile.winfo_children():
+            widget.bind("<Button-1>", self._on_tile_press)
+            widget.bind("<Shift-Button-1>", self._on_tile_shift_press)
+            widget.bind("<Control-Button-1>", self._on_tile_toggle_press)
+            widget.bind("<Command-Button-1>", self._on_tile_toggle_press)
+            widget.bind("<B1-Motion>", self._on_tile_motion)
+            widget.bind("<ButtonRelease-1>", self._on_tile_release)
+            # Right-click: Button-3 on Windows/Linux, Button-2 on macOS Tk.
+            widget.bind("<Button-2>", self._on_tile_right_click)
+            widget.bind("<Button-3>", self._on_tile_right_click)
 
-        self._refresh_card_styles()
-        self._schedule_preview_render()
-
-    def _find_card(self, widget: tk.Widget) -> ThumbnailCard | None:
-        """Walk up the widget hierarchy to find the enclosing ThumbnailCard."""
+    def _find_tile(self, widget: tk.Widget) -> PageTile | None:
+        """Walk up the widget hierarchy to find the enclosing PageTile."""
         w = widget
         while w is not None:
-            if isinstance(w, ThumbnailCard):
+            if isinstance(w, PageTile):
                 return w
             try:
                 w = w.master
@@ -649,35 +749,260 @@ class MergeView(tk.Frame):
                 break
         return None
 
-    def _get_target_index(self, y_root: int) -> int:
-        """
-        Determine which card index the cursor is hovering over.
+    def _on_tile_press(self, event: tk.Event) -> None:
+        """Plain click: select only this tile unless it's already selected."""
+        tile = self._find_tile(event.widget)
+        if tile is None:
+            return
+        self._press_mode = "plain"
+        if tile.page not in self._selected_pages:
+            self._selected_pages = {tile.page}
+            self._refresh_tile_styles()
+        self._active_page = tile.page
+        self._shift_anchor_page = tile.page
+        self._begin_potential_drag(tile, event)
+        self._schedule_preview_render()
 
-        Args:
-            y_root: Absolute screen Y coordinate.
+    def _on_tile_shift_press(self, event: tk.Event) -> None:
+        """Shift-click: select the range from the last anchor to this tile."""
+        tile = self._find_tile(event.widget)
+        if tile is None:
+            return
+        self._press_mode = "shift"
+        pages = self._vm.pages
+        anchor = self._shift_anchor_page if self._shift_anchor_page in pages else tile.page
+        try:
+            lo, hi = sorted((pages.index(anchor), pages.index(tile.page)))
+            self._selected_pages = set(pages[lo:hi + 1])
+        except ValueError:
+            self._selected_pages = {tile.page}
+        self._active_page = tile.page
+        self._refresh_tile_styles()
+        self._begin_potential_drag(tile, event)
+        self._schedule_preview_render()
 
-        Returns:
-            Target zero-based index, clamped to valid range.
+    def _on_tile_toggle_press(self, event: tk.Event) -> None:
+        """Command/Ctrl-click: toggle this tile's selection."""
+        tile = self._find_tile(event.widget)
+        if tile is None:
+            return
+        self._press_mode = "toggle"
+        if tile.page in self._selected_pages:
+            self._selected_pages.discard(tile.page)
+        else:
+            self._selected_pages.add(tile.page)
+        self._active_page = tile.page
+        self._shift_anchor_page = tile.page
+        self._refresh_tile_styles()
+        self._begin_potential_drag(tile, event)
+        self._schedule_preview_render()
+
+    def _on_tile_right_click(self, event: tk.Event) -> None:
+        """Right-click: select this tile (if not already part of the
+        selection) and show a context menu to delete the selected page(s)."""
+        tile = self._find_tile(event.widget)
+        if tile is None:
+            return
+        if tile.page not in self._selected_pages:
+            self._selected_pages = {tile.page}
+            self._active_page = tile.page
+            self._shift_anchor_page = tile.page
+            self._refresh_tile_styles()
+            self._schedule_preview_render()
+        self._show_page_context_menu(event)
+
+    def _show_page_context_menu(self, event: tk.Event) -> None:
+        """Pop up a context menu offering to delete the selected page(s)."""
+        count = len(self._selected_pages)
+        label = f"Delete {count} Page{'s' if count != 1 else ''}"
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=label, command=self._on_delete_selected_pages)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_delete_selected_pages(self) -> None:
+        """Remove the currently selected page(s) from the merge order."""
+        if not self._selected_pages:
+            return
+        pages_to_delete = list(self._selected_pages)
+        self._selected_pages.clear()
+        if self._active_page in pages_to_delete:
+            self._active_page = None
+        self._vm.delete_pages(pages_to_delete)
+
+    def _begin_potential_drag(self, tile: PageTile, event: tk.Event) -> None:
+        """Record press state so motion past a small threshold starts a drag."""
+        self._press_page = tile.page
+        self._press_root = (event.x_root, event.y_root)
+        self._dragging = False
+        self._drag_pages = None
+        self._drag_target_index = None
+        self._drop_before_tile = None
+
+    def _on_tile_motion(self, event: tk.Event) -> str:
+        """Start a drag once the cursor moves past a small threshold, then track it."""
+        if self._press_page is None or self._press_root is None:
+            return "break"
+
+        if not self._dragging:
+            dx = event.x_root - self._press_root[0]
+            dy = event.y_root - self._press_root[1]
+            if dx * dx + dy * dy < 16:
+                return "break"
+            self._dragging = True
+            if self._press_page in self._selected_pages and len(self._selected_pages) > 1:
+                self._drag_pages = [
+                    page for page in self._vm.pages if page in self._selected_pages
+                ]
+            else:
+                self._drag_pages = [self._press_page]
+                self._selected_pages = {self._press_page}
+            self._create_drag_ghost()
+
+        self._move_drag_ghost(event.x_root, event.y_root)
+        self._autoscroll_for_drag(event.y_root)
+        self._drag_target_index, self._drag_insert_after, self._drop_before_tile = (
+            self._compute_drop_target(event.y_root)
+        )
+        self._refresh_tile_styles()
+        return "break"
+
+    def _autoscroll_for_drag(self, y_root: int) -> None:
+        """Scroll the page canvas while dragging near its top/bottom edge."""
+        top = self._canvas.winfo_rooty()
+        bottom = top + self._canvas.winfo_height()
+        if y_root - top < 24:
+            self._canvas.yview_scroll(-1, "units")
+        elif bottom - y_root < 24:
+            self._canvas.yview_scroll(1, "units")
+
+    def _compute_drop_target(
+        self, y_root: int
+    ) -> tuple[int, bool, PageTile | None]:
         """
-        if not self._cards:
-            return 0
-        for i, card in enumerate(self._cards):
-            card_y = card.winfo_rooty()
-            card_h = card.winfo_height()
-            if y_root < card_y + card_h // 2:
-                return i
-        return len(self._cards) - 1
+        Determine where a dragged group would land if dropped at y_root.
+
+        Returns (target_index, insert_after, drop_before_tile). drop_before_tile
+        is the tile the group will be inserted before, or None when the drop
+        would append the group at the end of the list.
+        """
+        dragged_pages = set(self._drag_pages or [])
+        remaining_tiles = [
+            tile for tile in self._page_tiles if tile.page not in dragged_pages
+        ]
+        for tile in remaining_tiles:
+            midpoint = tile.winfo_rooty() + tile.winfo_height() // 2
+            if y_root < midpoint:
+                return tile.position, False, tile
+        if remaining_tiles:
+            return remaining_tiles[-1].position, True, None
+        return 0, False, None
+
+    def _create_drag_ghost(self) -> None:
+        """Create a small floating preview of the dragged page(s) near the cursor."""
+        if not self._drag_pages:
+            return
+        first_page = self._drag_pages[0]
+        photo = self._thumbnail_cache.get(
+            (first_page.path.resolve(), first_page.page_index)
+        )
+
+        ghost = tk.Toplevel(self)
+        ghost.overrideredirect(True)
+        ghost.attributes("-topmost", True)
+        try:
+            ghost.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+
+        frame = tk.Frame(ghost, bd=2, relief=tk.SOLID, bg="#4a90d9")
+        frame.pack()
+        if photo is not None:
+            tk.Label(frame, image=photo, bg="#ffffff").pack(padx=2, pady=2)
+        else:
+            tk.Label(frame, text=first_page.path.name, bg="#ffffff",
+                     width=12, height=4, wraplength=100).pack(padx=2, pady=2)
+        if len(self._drag_pages) > 1:
+            tk.Label(
+                frame,
+                text=f"{len(self._drag_pages)} pages",
+                bg="#4a90d9",
+                fg="white",
+                font=("Helvetica", 8, "bold"),
+            ).pack(fill=tk.X)
+
+        ghost._ghost_photo = photo  # keep a reference alive for the window's lifetime
+        ghost.update_idletasks()
+        self._drag_ghost = ghost
+
+    def _move_drag_ghost(self, x_root: int, y_root: int) -> None:
+        """Reposition the floating drag preview near the cursor."""
+        if self._drag_ghost is not None:
+            self._drag_ghost.geometry(f"+{x_root + 16}+{y_root + 16}")
+
+    def _destroy_drag_ghost(self) -> None:
+        """Remove the floating drag preview, if one is showing."""
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
+
+    def _on_tile_release(self, event: tk.Event) -> str:
+        """Finish a drag by reordering pages, or finalize a plain-click selection."""
+        if self._press_page is None:
+            return "break"
+
+        self._destroy_drag_ghost()
+
+        if self._dragging and self._drag_pages and self._drag_target_index is not None:
+            reordered = self._vm.reorder_page_group(
+                self._vm.pages,
+                self._drag_pages,
+                self._drag_target_index,
+                self._drag_insert_after,
+            )
+            if reordered != self._vm.pages:
+                self._vm.set_page_order(reordered)
+            else:
+                self._refresh_tile_styles()
+        elif self._press_mode == "plain" and len(self._selected_pages) > 1:
+            self._selected_pages = {self._press_page}
+            self._refresh_tile_styles()
+
+        self._press_page = None
+        self._press_mode = None
+        self._press_root = None
+        self._dragging = False
+        self._drag_pages = None
+        self._drag_target_index = None
+        self._drop_before_tile = None
+        return "break"
+
+    def _refresh_tile_styles(self) -> None:
+        """Update tile highlighting for selection and drag feedback."""
+        dragging_pages = set(self._drag_pages) if self._dragging and self._drag_pages else set()
+        for tile in self._page_tiles:
+            if tile.page in dragging_pages:
+                tile.set_style(bg="#dce8f8", relief=tk.SUNKEN)
+            elif self._dragging and self._drop_before_tile is tile:
+                tile.set_style(bg="#ffe08a", relief=tk.SOLID)
+            elif tile.page in self._selected_pages:
+                tile.set_style(bg="#eef5ff", relief=tk.SOLID)
+            else:
+                tile.set_style(bg="#f5f5f5", relief=tk.RAISED)
+
 
     # ------------------------------------------------------------------
     # Canvas scroll helpers
     # ------------------------------------------------------------------
 
     def _on_frame_configure(self, event: tk.Event) -> None:
-        """Update canvas scroll region when card frame resizes."""
+        """Update canvas scroll region when the tile frame resizes."""
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
-        """Expand card frame to fill canvas width."""
+        """Expand tile frame to fill canvas width."""
         self._canvas.itemconfig(self._canvas_window, width=event.width)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
@@ -686,7 +1011,7 @@ class MergeView(tk.Frame):
             self._canvas.yview_scroll(-1, "units")
         elif event.num == 5:
             self._canvas.yview_scroll(1, "units")
-        else:
+        elif event.delta:
             self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ------------------------------------------------------------------
@@ -695,7 +1020,8 @@ class MergeView(tk.Frame):
 
     def _on_preview_configure(self, event: tk.Event) -> None:
         """Redraw preview image when the preview panel size changes."""
-        self._schedule_preview_render()
+        if event.width > 1 and event.height > 1:
+            self._schedule_preview_render()
 
     def _on_preview_mousewheel(self, event: tk.Event) -> None:
         """Move preview by exactly one page per wheel tick."""
@@ -710,10 +1036,11 @@ class MergeView(tk.Frame):
 
     def _on_preview_scrollbar(self, *args: str) -> None:
         """Handle scrollbar actions as discrete page navigation."""
-        if self._selected_index is None:
+        page_count = len(self._vm.pages)
+        if not page_count or not args:
             return
-        page_count = self._vm.documents[self._selected_index].page_count
-        if page_count <= 0:
+        current_index = self._active_page_index()
+        if current_index is None:
             return
 
         if args[0] == "scroll":
@@ -721,31 +1048,67 @@ class MergeView(tk.Frame):
         elif args[0] == "moveto":
             fraction = float(args[1])
             target = min(max(int(fraction * page_count), 0), page_count - 1)
-            if target != self._preview_page_index:
-                self._preview_page_index = target
-                self._schedule_preview_render()
+            self._select_page_index(target)
 
     def _change_preview_page(self, step: int) -> None:
-        """Increment/decrement the selected preview page index by one step."""
-        if self._selected_index is None:
+        """Move the preview to another page in the merged output order."""
+        current_index = self._active_page_index()
+        if current_index is None:
             return
-        page_count = self._vm.documents[self._selected_index].page_count
-        if page_count <= 0:
-            return
-
-        new_index = min(max(self._preview_page_index + step, 0), page_count - 1)
-        if new_index != self._preview_page_index:
-            self._preview_page_index = new_index
-            self._schedule_preview_render()
+        target = min(max(current_index + step, 0), len(self._vm.pages) - 1)
+        self._select_page_index(target)
 
     def _sync_preview_scrollbar(self, page_count: int) -> None:
-        """Position preview scrollbar thumb based on current page index."""
+        """Position preview scrollbar thumb based on the active page."""
         if page_count <= 0:
             self._preview_scrollbar.set(0.0, 1.0)
             return
-        first = self._preview_page_index / page_count
-        last = (self._preview_page_index + 1) / page_count
+        page_index = self._active_page_index()
+        if page_index is None:
+            self._preview_scrollbar.set(0.0, 1.0)
+            return
+        first = page_index / page_count
+        last = (page_index + 1) / page_count
         self._preview_scrollbar.set(first, last)
+
+    def _active_page_index(self) -> int | None:
+        if self._active_page is None:
+            return None
+        try:
+            return self._vm.pages.index(self._active_page)
+        except ValueError:
+            return None
+
+    def _select_page_index(self, index: int) -> None:
+        if not 0 <= index < len(self._vm.pages):
+            return
+        self._active_page = self._vm.pages[index]
+        self._selected_pages = {self._active_page}
+        self._shift_anchor_page = self._active_page
+        self._refresh_tile_styles()
+        self._ensure_tile_visible(self._active_page)
+        self._schedule_preview_render()
+
+    def _ensure_tile_visible(self, page: PdfPage) -> None:
+        """Scroll the page canvas so the given page's tile is visible."""
+        tile = next((t for t in self._page_tiles if t.page == page), None)
+        if tile is None:
+            return
+        self._canvas.update_idletasks()
+        bbox = self._canvas.bbox("all")
+        if not bbox:
+            return
+        total_height = bbox[3] - bbox[1]
+        if total_height <= 0:
+            return
+        tile_top = tile.winfo_y()
+        tile_bottom = tile_top + tile.winfo_height()
+        view_top = self._canvas.canvasy(0)
+        view_height = self._canvas.winfo_height()
+        if tile_top < view_top:
+            self._canvas.yview_moveto(tile_top / total_height)
+        elif tile_bottom > view_top + view_height:
+            self._canvas.yview_moveto((tile_bottom - view_height) / total_height)
 
     def _schedule_preview_render(self) -> None:
         """Debounce expensive preview rendering during rapid resize events."""
@@ -754,48 +1117,61 @@ class MergeView(tk.Frame):
         self._preview_after_id = self.after(100, self._render_preview)
 
     def _render_preview(self) -> None:
-        """Render selected document preview to fit the right-side panel."""
+        """Render the active page from the current merged output order."""
         self._preview_after_id = None
         self._preview_canvas.delete("all")
 
-        docs = self._vm.documents
-        if not docs or self._selected_index is None:
+        page_count = len(self._vm.pages)
+        page_index = self._active_page_index()
+        if not page_count or page_index is None:
+            self._preview_label.configure(text="Select a page to preview")
             self._sync_preview_scrollbar(0)
+            self._preview_render_info = None
+            self._preview_rendered_page = None
             self._preview_canvas.create_text(
                 self._preview_canvas.winfo_width() // 2,
                 self._preview_canvas.winfo_height() // 2,
-                text="Select a PDF to preview",
+                text="No pages loaded",
                 fill="#bbbbbb",
                 font=("Helvetica", 14),
             )
             return
 
-        page_count = docs[self._selected_index].page_count
-        if page_count <= 0:
-            self._sync_preview_scrollbar(0)
-            self._preview_canvas.create_text(
-                self._preview_canvas.winfo_width() // 2,
-                self._preview_canvas.winfo_height() // 2,
-                text="PDF has no pages",
-                fill="#bbbbbb",
-                font=("Helvetica", 14),
-            )
-            return
-
-        self._preview_page_index = min(max(self._preview_page_index, 0), page_count - 1)
         self._sync_preview_scrollbar(page_count)
+        page = self._vm.pages[page_index]
 
-        max_width = max(self._preview_canvas.winfo_width() - 30, 200)
-        max_height = max(self._preview_canvas.winfo_height() - 30, 200)
+        # Reset zoom/pan when the displayed page changes.
+        if page != self._preview_rendered_page:
+            self._preview_zoom = PREVIEW_MIN_ZOOM
+            self._preview_pan = (0.5, 0.5)
+
+        zoom_suffix = (
+            f"  ·  {round(self._preview_zoom * 100)}% zoom"
+            if self._preview_zoom > PREVIEW_MIN_ZOOM else ""
+        )
+        self._preview_label.configure(
+            text=(
+                f"Page {page_index + 1} of {page_count}  ·  "
+                f"{page.path.name} — source page {page.page_index + 1}"
+                f"{zoom_suffix}"
+            )
+        )
+
+        fit_width = max(self._preview_canvas.winfo_width() - 30, 200)
+        fit_height = max(self._preview_canvas.winfo_height() - 30, 200)
+        desired_width = min(int(fit_width * self._preview_zoom), PREVIEW_MAX_RENDER_DIM)
+        desired_height = min(int(fit_height * self._preview_zoom), PREVIEW_MAX_RENDER_DIM)
 
         try:
-            image = self._vm.render_preview(
-                self._selected_index,
-                max_width,
-                max_height,
-                page_index=self._preview_page_index,
+            full_image = self._vm.render_preview_for_file(
+                page.path,
+                page_index=page.page_index,
+                max_width=desired_width,
+                max_height=desired_height,
             )
         except Exception as e:
+            self._preview_render_info = None
+            self._preview_rendered_page = None
             self._preview_canvas.create_text(
                 self._preview_canvas.winfo_width() // 2,
                 self._preview_canvas.winfo_height() // 2,
@@ -806,28 +1182,112 @@ class MergeView(tk.Frame):
             )
             return
 
-        if image is None:
+        if full_image is None:
             return
 
-        self._preview_photo = ImageTk.PhotoImage(image)
+        self._preview_rendered_page = page
+        img_w, img_h = full_image.size
+        crop_w = min(fit_width, img_w)
+        crop_h = min(fit_height, img_h)
+
+        pan_x, pan_y = self._preview_pan
+        center_x = pan_x * img_w
+        center_y = pan_y * img_h
+        left = int(min(max(center_x - crop_w / 2, 0), max(img_w - crop_w, 0)))
+        top = int(min(max(center_y - crop_h / 2, 0), max(img_h - crop_h, 0)))
+
+        if crop_w < img_w or crop_h < img_h:
+            visible_image = full_image.crop((left, top, left + crop_w, top + crop_h))
+        else:
+            visible_image = full_image
+
+        self._preview_photo = ImageTk.PhotoImage(visible_image)
         canvas_w = self._preview_canvas.winfo_width()
         canvas_h = self._preview_canvas.winfo_height()
+        draw_x = canvas_w // 2 - crop_w // 2
+        draw_y = canvas_h // 2 - crop_h // 2
         self._preview_canvas.create_image(canvas_w // 2, canvas_h // 2,
                                           image=self._preview_photo,
                                           anchor="center")
 
-    def _refresh_card_styles(
-        self,
-        target_index: int | None = None,
-        dragging_index: int | None = None,
-    ) -> None:
-        """Update card highlight states for selection and drag feedback."""
-        for i, card in enumerate(self._cards):
-            if i == dragging_index:
-                card.configure(bg="#dce8f8", relief=tk.SUNKEN)
-            elif target_index is not None and i == target_index:
-                card.configure(bg="#e8f4e8", relief=tk.RAISED)
-            elif i == self._selected_index:
-                card.configure(bg="#eef5ff", relief=tk.SOLID)
-            else:
-                card.configure(bg="#f5f5f5", relief=tk.RAISED)
+        self._preview_render_info = {
+            "img_w": img_w,
+            "img_h": img_h,
+            "crop_left": left,
+            "crop_top": top,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+            "draw_x": draw_x,
+            "draw_y": draw_y,
+        }
+
+    # ------------------------------------------------------------------
+    # Preview zoom and pan (view-only; never affects the merged PDF)
+    # ------------------------------------------------------------------
+
+    def _on_preview_press(self, event: tk.Event) -> None:
+        """Record the press position so a later release can zoom or pan."""
+        self._preview_press_pos = (event.x, event.y)
+        self._preview_press_pan = self._preview_pan
+        self._preview_dragging = False
+
+    def _on_preview_drag(self, event: tk.Event) -> None:
+        """Pan the zoomed view by dragging, once past a small threshold."""
+        if self._preview_press_pos is None or self._preview_press_pan is None:
+            return
+        if self._preview_zoom <= PREVIEW_MIN_ZOOM:
+            return
+
+        dx = event.x - self._preview_press_pos[0]
+        dy = event.y - self._preview_press_pos[1]
+        if not self._preview_dragging:
+            if dx * dx + dy * dy < 16:
+                return
+            self._preview_dragging = True
+
+        info = self._preview_render_info
+        if not info or not info["img_w"] or not info["img_h"]:
+            return
+
+        start_x, start_y = self._preview_press_pan
+        new_x = min(max(start_x - dx / info["img_w"], 0.0), 1.0)
+        new_y = min(max(start_y - dy / info["img_h"], 0.0), 1.0)
+        self._preview_pan = (new_x, new_y)
+        self._schedule_preview_render()
+
+    def _on_preview_release(self, event: tk.Event) -> None:
+        """Finish a pan drag, or treat a plain click as zoom-in on the cursor."""
+        was_dragging = self._preview_dragging
+        self._preview_press_pos = None
+        self._preview_press_pan = None
+        self._preview_dragging = False
+        if not was_dragging:
+            self._zoom_preview(event.x, event.y, zoom_in=True)
+
+    def _on_preview_zoom_out_click(self, event: tk.Event) -> None:
+        """Right-click: zoom back out, centered on the cursor."""
+        self._zoom_preview(event.x, event.y, zoom_in=False)
+
+    def _zoom_preview(self, canvas_x: int, canvas_y: int, zoom_in: bool) -> None:
+        """Change the preview zoom level, centering the view on the cursor."""
+        info = self._preview_render_info
+        if info is None or not info["img_w"] or not info["img_h"]:
+            return
+
+        local_x = min(max(canvas_x - info["draw_x"], 0), info["crop_w"])
+        local_y = min(max(canvas_y - info["draw_y"], 0), info["crop_h"])
+        page_x = info["crop_left"] + local_x
+        page_y = info["crop_top"] + local_y
+
+        if zoom_in:
+            new_zoom = min(self._preview_zoom * PREVIEW_ZOOM_STEP, PREVIEW_MAX_ZOOM)
+        else:
+            new_zoom = max(self._preview_zoom / PREVIEW_ZOOM_STEP, PREVIEW_MIN_ZOOM)
+
+        if new_zoom <= PREVIEW_MIN_ZOOM:
+            self._preview_zoom = PREVIEW_MIN_ZOOM
+            self._preview_pan = (0.5, 0.5)
+        else:
+            self._preview_zoom = new_zoom
+            self._preview_pan = (page_x / info["img_w"], page_y / info["img_h"])
+        self._schedule_preview_render()

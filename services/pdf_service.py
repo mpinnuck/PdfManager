@@ -1,14 +1,14 @@
 """
 pdf_service.py
 --------------
-Handles PDF file operations: loading metadata and merging documents.
+Handles PDF file operations: loading metadata and merging selected pages.
 Uses pypdf for merge operations.
 """
 
 from pathlib import Path
 from pypdf import PdfReader, PdfWriter
 
-from models.pdf_document import PdfDocument
+from models.pdf_page import PdfPage
 
 
 class PdfService:
@@ -17,7 +17,7 @@ class PdfService:
 
     Responsibilities:
         - Reading page counts from PDF files.
-        - Merging an ordered list of PdfDocuments into a single output PDF.
+        - Merging an ordered list of PDF pages into a single output PDF.
     """
 
     def load_page_count(self, pdf_path: Path) -> int:
@@ -29,37 +29,34 @@ class PdfService:
 
         Returns:
             Page count as an integer.
-
-        Raises:
-            FileNotFoundError: If the file does not exist.
-            Exception: If pypdf cannot read the file.
         """
         reader = PdfReader(str(pdf_path))
         return len(reader.pages)
 
-    def merge(self, documents: list[PdfDocument], output_path: Path) -> None:
+    def merge(self, pages: list[PdfPage], output_path: Path) -> None:
         """
-        Merge an ordered list of PdfDocuments into a single PDF file.
-
-        Pages from each document are appended in list order.
+        Merge an ordered list of PDF pages into a single output PDF.
 
         Args:
-            documents:   Ordered list of PdfDocument instances to merge.
+            pages:       Ordered page references to merge.
             output_path: Destination path for the merged PDF.
 
         Raises:
-            ValueError: If documents list is empty.
+            ValueError: If pages list is empty.
             Exception:  If any source PDF cannot be read or output cannot be written.
         """
-        if not documents:
-            raise ValueError("No documents provided for merge.")
+        if not pages:
+            raise ValueError("No pages provided for merge.")
 
         writer = PdfWriter()
-        for doc in documents:
-            reader = PdfReader(str(doc.path))
-            for page in reader.pages:
-                writer.add_page(page)
+        readers: dict[Path, PdfReader] = {}
+        for page in pages:
+            reader = readers.get(page.path)
+            if reader is None:
+                reader = PdfReader(str(page.path))
+                readers[page.path] = reader
+            writer.add_page(reader.pages[page.page_index])
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as f:
-            writer.write(f)
+        with open(output_path, "wb") as output_file:
+            writer.write(output_file)

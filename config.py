@@ -36,6 +36,7 @@ _DEFAULTS: dict = {
     "window_geometry": "860x700",
     "last_folder": str(Path.home()),
     "session_input_files": [],
+    "session_page_order": [],
     "session_last_output": None,
 }
 
